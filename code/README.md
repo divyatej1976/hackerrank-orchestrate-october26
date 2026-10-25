@@ -11,11 +11,11 @@ remediation and verification steps.
 
 | Metric | Result |
 |---|---:|
-| Status accuracy | 100.0% |
-| Exact-row / sequence accuracy | 65.6% |
+| Status accuracy | 96.9% |
+| Exact-row / sequence accuracy | 46.9% |
 | Step precision | 100.0% |
-| Step recall | 93.8% |
-| Field accuracy | 92.2% |
+| Step recall | 88.6% |
+| Field accuracy | 86.1% |
 
 51 authored regression tests cover the audit and Groq intent client. The full
 run produces 518 contract-valid rows. Cold Groq runs are sequential and take
@@ -92,7 +92,7 @@ and the four original request texts. The 518-row NOT_APPLICABLE set remains 10.
 | Intent | `audit/core.py` `deletion_intent`, `audit/llm.py`, `prompts/intent_classification.md` | Rules are authoritative in the default shadow mode. Groq openai/gpt-oss-120b returns a JSON second opinion at temperature 0; explicit refusal always wins. Disagreements retain case diagnostics. Model/prompt/text-hashed local response caching separates live and reused token usage. |
 | Identity | `IdentityIndex` | Resolves the request email (any case, current or historical) to a `user_id` and expands every email, phone and hash from `user_identities.csv` + `user_audit_log.csv`. |
 | Ingestion | `audit/ingestion.py`, `audit/layout.py` | Parses JSON, logs (several wrapper formats), SQL snapshots (isolated in-memory SQLite), text, PDFs (`pypdf`) and screenshots (spatial OCR keeps table rows together) into time-stamped observations with their `file_id`. |
-| Ownership | `AuditEngine.workflow_resources` | Uses direct identifiers, readback lookup keys and resource references, plus workflow-window/report-result ownership heuristics. A primary-account slot fills the account when exactly one status-consistent worker candidate remains after elimination. State still requires eligible evidence. |
+| Ownership | `AuditEngine.workflow_resources` | Uses direct identifiers, readback lookup keys and resource references, plus workflow-window/report-result ownership heuristics. An optional primary-account slot (`WORKFLOW_SLOTS`, disabled in the final run) can fill the account when exactly one status-consistent worker candidate remains. State still requires eligible evidence. |
 | State | `_state` | Picks the latest evidence available at or before `audit_at`; workflow statuses and operation results are treated as claims, never proof. Replica and snapshot scopes are checked separately. |
 | Policy and plan | `audit` | Applies DELETE / REDACT / ANONYMIZE / RETAIN / tombstone rules, reports active flows and restore risks, disables flows and blocks restores before dependent records, and orders steps by the spec's operation table, then `system_id`, then `resource_id`. |
 | Validation | `validate` | Fails the run on any contract break: row set, status values, empty `[]` for NOT_APPLICABLE, step order and numbering, operation/state pairs, citations dated after `audit_at`, or citations on future steps. |

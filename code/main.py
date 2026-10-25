@@ -9,7 +9,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from audit.core import AuditEngine, read_csv, deletion_intent
+from audit.core import AuditEngine, case_key, read_csv, deletion_intent
 from audit.llm import configure, DEFAULT_MODE, write_usage_report
 from audit.reporting import persist_index, write_case_report
 
@@ -45,7 +45,7 @@ def main():
     print(f'Inspected {len(engine.ingestion)} evidence files; {len(engine.observations)} observations; {len(failed)} failures', flush=True)
     if failed:
         raise RuntimeError('Evidence ingestion failed. See .runtime/ingestion.json; refusing silent omissions.')
-    rows = [engine.audit(request) for request in sorted(requests, key=lambda r: r['case_id'])]
+    rows = [engine.audit(request) for request in sorted(requests, key=lambda r: case_key(r['case_id']))]
     engine.validate(rows, requests)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix('.csv.tmp')

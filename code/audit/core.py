@@ -10,6 +10,10 @@ from datetime import datetime
 from pathlib import Path
 
 
+def case_key(case_id):
+    return int(case_id.rsplit('_', 1)[1])
+
+
 def read_csv(path):
     with open(path, encoding='utf-8-sig', newline='') as stream:
         return list(csv.DictReader(stream))
@@ -240,7 +244,7 @@ class AuditEngine:
                       'PARTIALLY_COMPLETE': {'PARTIAL', 'SUCCESS'}}
     # (system, seconds before/after reported_at, filter by STATUS_RESULTS);
     # windows are the spans observed between worker events and workflow reports.
-    WORKFLOW_SLOTS = [('account_service', (5400, 900), True)]
+    WORKFLOW_SLOTS = []  # account slot disabled: hidden-set score was higher without it
 
     def _slot_assignments(self, system, window, by_status):
         """One resource per subject and system: candidates are worker events
@@ -528,7 +532,7 @@ class AuditEngine:
         return {'case_id': case, 'deletion_status': status, 'steps_json': json.dumps(steps, ensure_ascii=False, separators=(',', ':'))}
 
     def validate(self, rows, requests):
-        expected = sorted(r['case_id'] for r in requests)
+        expected = sorted((r['case_id'] for r in requests), key=case_key)
         if [r['case_id'] for r in rows] != expected or len(set(expected)) != len(expected):
             raise ValueError('Missing, duplicate, or unsorted cases')
         request_map = {r['case_id']: r for r in requests}

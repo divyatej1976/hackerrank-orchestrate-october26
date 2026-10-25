@@ -44,8 +44,8 @@ flowchart TD
 | Evaluation | `evaluation/` | Runs public sample inference before opening expected labels, executes mocked regressions, computes metrics and records the intent regression gate. |
 | Packaging | `package_submission.py` | Builds code.zip with runnable sources, the actual prompt, implemented documentation and evaluation reports, excluding the corpus and caches. |
 
-The default workflow resolver includes completion-window correlation and a
-status-consistent primary-account slot. These are ownership heuristics;
+The default workflow resolver includes completion-window correlation; a
+status-consistent primary-account slot exists but is disabled in the final run. These are ownership heuristics;
 reported statuses/results never establish record state. The stricter
 cross-case solver in `audit/ownership.py` is available as an evaluation
 experiment and is disabled by default after failing the regression gate.
@@ -117,8 +117,7 @@ on PATH and currently lack Windows row-layout OCR. No Groq key or prebuilt cache
 is required for the rules-authoritative CLI; see README for extraction layout
 and commands.
 
-Public exact-row agreement remains 65.625%, despite 100% status accuracy and
-step precision. Ownership gaps remain, OCR misses some small identifiers,
+Public exact-row agreement is 46.875% (status 96.875%, step precision 100%). Ownership gaps remain, OCR misses some small identifiers,
 historical identity validity is not fully modeled and conditional policy
 handling is not generalized beyond supported evidence categories. The local
 HTML report and SQLite index expose the actual results; they are not proof of

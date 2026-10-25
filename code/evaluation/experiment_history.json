@@ -137,5 +137,20 @@
     "expected_steps": 193,
     "matched_fields": 1246,
     "field_denominator": 1351
+  },
+  "Final: baseline (account slot disabled)": {
+    "cases": 32,
+    "status_accuracy": 0.96875,
+    "exact_row_accuracy": 0.46875,
+    "sequence_accuracy": 0.46875,
+    "step_precision": 1.0,
+    "step_recall": 0.8860103626943006,
+    "step_f1": 0.9395604395604396,
+    "field_accuracy": 0.8608438193930422,
+    "matched_steps": 171,
+    "predicted_steps": 171,
+    "expected_steps": 193,
+    "matched_fields": 1163,
+    "field_denominator": 1351
   }
 }
