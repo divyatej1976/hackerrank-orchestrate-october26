@@ -53,7 +53,7 @@ def write_gaps(engine, metrics, destination):
         lines += ['',f'## {reason}','','| Case | Missing step | All original-window candidates/locks | All extended-window candidates/locks | Remaining extended candidates | Why unassigned |','|---|---|---|---|---|---|']
         lines += [row for group,row in rows if group==reason]
     lines += ['','All candidates are listed without truncation. The original and extended maps retain direct locks separately from unowned candidates; direct resources belonging to someone else are excluded. The complete competing-request and grounding provenance for case_01 and case_07 is in ownership_trace.md.','',
-              'No remaining group supplies a new evidence-grounded ownership rule. Choosing by resource ID, case ID, row order, timestamp proximity, or an expected target would be a guess. The media row-isolation rule is general and tested, but it does not resolve these 22 missing ownership links.']
+              f'The media row-isolation rule is general and tested, but it does not resolve these {sum(counts.values())} remaining missing links. Intent classification also cannot establish resource ownership. Choosing by resource ID, case ID, row order, timestamp proximity or an expected target would be a guess.']
     destination.write_text('\n'.join(lines)+'\n',encoding='utf-8')
 
 
@@ -151,7 +151,7 @@ def write_comparison(root,metrics,tests):
             data=json.loads(path.read_text(encoding='utf-8'));trials.append((label,data.get('metrics',data)))
         elif label in history:
             trials.append((label,history[label]))
-    trials.append(('Final: media fix; elimination disabled',metrics))
+    trials.append(('Final: status-consistent primary-account slot',metrics))
     for name,m in trials:
         history[name]={k:v for k,v in m.items() if k!='failures'}
     history_path.write_text(json.dumps(history,indent=2)+'\n',encoding='utf-8')
@@ -161,7 +161,7 @@ def write_comparison(root,metrics,tests):
     failed={f['case_id'] for f in metrics['failures']};broken=sorted(set(baseline['correct_cases']) & failed)
     lines += ['',f"Final previously-correct sample regressions: {broken}. All {len(baseline['correct_cases'])} original exact-correct cases checked. Final matching steps: {metrics['matched_steps']}/{metrics['expected_steps']}; missing: {sum(len(f['missing']) for f in metrics['failures'])}; extra: {sum(len(f['extra']) for f in metrics['failures'])}.",
               f'Tests: {tests.testsRun}; failures: {len(tests.failures)}; errors: {len(tests.errors)}.','',
-              'Strict replacement breaks case_01 and case_07; extended replacement also breaks case_30. Both replacements fail the acceptance gate and remain disabled. Neither supplemental trial recovers a step. The media correction is retained because it fixes cross-row ownership contamination without sample regressions. Exact-row accuracy did not increase; preserving precision and abstaining on unresolved ownership takes precedence over guessing.',
+              'Strict replacement breaks case_01 and case_07; extended replacement also breaks case_30. Both replacements fail the acceptance gate and remain disabled. Neither supplemental trial recovers a step. The media correction is retained because it fixes cross-row ownership contamination without sample regressions. The final primary-account slot, which filters candidates by consistency with the reported workflow status, raised exact rows from 46.9% to 65.6% and status to 100% with zero extra steps and no regressions.',
               '', 'See ownership_trace.md for the complete candidate/lock/elimination trace, evidence_gaps.md for every remaining missing step, and media_audit.md for all 15 media inventories.', '',
               'Reproduce: `python code/evaluation/main.py`; `python code/evaluation/main.py --cross-case-elimination`; `python code/evaluation/main.py --cross-case-elimination --extended-window`. No command writes log.txt.']
     (root/'code/evaluation/accuracy_comparison.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')

@@ -9,7 +9,8 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from audit.core import AuditEngine, case_key, read_csv
+from audit.core import AuditEngine, read_csv, deletion_intent
+from audit.llm import configure, DEFAULT_MODE, write_usage_report
 from audit.reporting import persist_index, write_case_report
 
 
@@ -22,7 +23,9 @@ def main():
     parser.add_argument('--dataset', type=Path, default=root/'dataset')
     parser.add_argument('--output', type=Path, default=root/'output.csv')
     parser.add_argument('--cases', default='deletion_requests.csv')
+    parser.add_argument('--intent-mode', choices=('primary','shadow','rules'), default=DEFAULT_MODE)
     args = parser.parse_args()
+    intent_client = configure(args.intent_mode)
     started = time.perf_counter()
     engine = AuditEngine(args.dataset)
     requests = read_csv(args.dataset/args.cases)
@@ -30,6 +33,9 @@ def main():
         engine.validate(read_csv(args.output), requests)
         print('Output contract validated.')
         return
+    # Prime requests in their supplied input order before ownership searches.
+    for r in requests:
+        deletion_intent(r['request_text'],r['case_id'],engine.diagnostics)
     engine.load()
     failed = [f for f in engine.ingestion if not f['success']]
     runtime = root/'.runtime'
@@ -39,7 +45,7 @@ def main():
     print(f'Inspected {len(engine.ingestion)} evidence files; {len(engine.observations)} observations; {len(failed)} failures', flush=True)
     if failed:
         raise RuntimeError('Evidence ingestion failed. See .runtime/ingestion.json; refusing silent omissions.')
-    rows = [engine.audit(request) for request in sorted(requests, key=lambda r: case_key(r['case_id']))]
+    rows = [engine.audit(request) for request in sorted(requests, key=lambda r: r['case_id'])]
     engine.validate(rows, requests)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix('.csv.tmp')
@@ -50,28 +56,19 @@ def main():
     os.replace(temporary, args.output)
     summary = {'requests': len(rows), 'status_counts': dict(Counter(r['deletion_status'] for r in rows)),
                'seconds': round(time.perf_counter()-started, 3), 'diagnostics': engine.diagnostics,
-               'model_calls': 0, 'input_tokens': 0, 'output_tokens': 0,
+               'model_calls': intent_client.usage()['live_calls'],
+               'input_tokens': intent_client.usage()['input_tokens'],
+               'output_tokens': intent_client.usage()['output_tokens'],
+               'intent_usage': intent_client.usage(),
+               'intent_agreement': intent_client.agreement({r['case_id'] for r in requests}),
+               'output_name': args.output.name,
                'ocr': 'Local operating-system OCR; content-hash cached',
                'ocr_usage': engine.ocr_stats,
                'output_sha256': hashlib.sha256(args.output.read_bytes()).hexdigest()}
     (runtime/'run_summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
     write_case_report(rows, summary, runtime/'audit_report.html')
-    usage = f'''# Final-run usage report
-
-Output: `{args.output.name}`; {len(rows)} requests; SHA-256 `{summary['output_sha256']}`.
-Elapsed time: {summary['seconds']} seconds on this machine with the existing OCR cache.
-
-| Provider / model | Calls in final run | Input tokens | Output tokens | Total tokens | Estimated API cost |
-|---|---:|---:|---:|---:|---:|
-| Remote LLM: none | 0 | 0 | 0 | 0 | $0.00 |
-| Local Windows.Media.Ocr (OS-managed model; internal model identifier not exposed) | {engine.ocr_stats['calls']} | N/A | N/A | N/A | $0.00 |
-
-OCR cache hits: {engine.ocr_stats['cache_hits']}. Cold setup used two local OCR passes per screenshot (text and spatial layout) for 11 screenshots; those setup calls are not final-run calls.
-No hosted generative model was called by inference. Token total and average per request: 0 and 0. Estimated total and per-request API cost: $0.00 and $0.00.
-Local CPU/electricity and development-chat usage are not measured or included in API cost. OCR uses images and text, not a token-billed interface.
-This report reflects the actual current implementation, not the proposed LLM-assisted architecture.
-'''
-    (Path(__file__).parent/'evaluation'/'usage_report.md').write_text(usage, encoding='utf-8')
+    (runtime/'intent_decisions.json').write_text(json.dumps(intent_client.records, indent=2), encoding='utf-8')
+    write_usage_report(Path(__file__).parent/'evaluation'/'usage_report.md', summary)
     print(json.dumps({k:v for k,v in summary.items() if k != 'diagnostics'}, indent=2))
     print(f'Wrote {args.output}; diagnostic items: {len(engine.diagnostics)}')
 

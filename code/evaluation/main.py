@@ -6,7 +6,8 @@ from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from audit.core import AuditEngine, read_csv
+from audit.core import AuditEngine, read_csv, deletion_intent
+from audit import llm
 
 
 def key(step):
@@ -51,6 +52,10 @@ def evaluate(predictions, expected):
 
 
 def infer(engine, requests):
+    # Match the main CLI: classify the requested inputs in their given order
+    # before global ownership can revisit other intake windows.
+    for request in requests:
+        deletion_intent(request['request_text'],request['case_id'],engine.diagnostics)
     predictions=[]
     for request in requests:
         try:
@@ -70,7 +75,9 @@ def main():
     parser.add_argument('--cross-case-elimination',action='store_true')
     parser.add_argument('--extended-window',action='store_true')
     parser.add_argument('--supplemental',action='store_true',help='Trial strict links as additions to the baseline')
+    parser.add_argument('--intent-mode',choices=('primary','shadow','rules'),default=llm.DEFAULT_MODE)
     args=parser.parse_args()
+    intent_client=llm.configure(args.intent_mode)
     if (args.extended_window or args.supplemental) and not args.cross_case_elimination:
         parser.error('Window and supplemental experiments require --cross-case-elimination')
     runtime=root/'.runtime';runtime.mkdir(exist_ok=True)
@@ -86,6 +93,39 @@ def main():
     # Labels are opened only after inference is complete.
     expected=read_csv(args.expected or args.dataset/'sample_output.csv')
     metrics=evaluate(predictions,expected)
+    rejected_intent_trial=None
+    from intent_evaluation import comparison as compare_intent, write_report as write_intent_report
+    intent_comparison=compare_intent(root,args.dataset,metrics,expected)
+    if (engine is not None and not args.capture_baseline and not args.cross_case_elimination
+            and intent_client.mode=='primary' and intent_comparison['gate_failed']):
+        # Persist only the policy enum, never labels or expected operations.
+        rejected_intent_trial=intent_comparison
+        primary_summary_path=runtime/'run_summary.json'
+        if primary_summary_path.exists():
+            primary_summary=json.loads(primary_summary_path.read_text(encoding='utf-8'))
+            rejected_intent_trial['primary_run_usage']=primary_summary.get('intent_usage',{})
+            (runtime/'groq_primary_run_summary.json').write_text(json.dumps(primary_summary,indent=2),encoding='utf-8')
+        (runtime/'groq_rejected_trial.json').write_text(json.dumps(rejected_intent_trial,indent=2),encoding='utf-8')
+        llm.POLICY_PATH.write_text('{"mode":"shadow"}\n',encoding='utf-8')
+        print('Intent regression gate failed; keeping rules and using Groq only as a second opinion.')
+        import subprocess
+        subprocess.run([sys.executable,str(root/'code/main.py'),'--dataset',str(args.dataset),'--intent-mode','shadow'],check=True)
+        subprocess.run([sys.executable,str(root/'code/main.py'),'validate','--dataset',str(args.dataset)],check=True)
+        intent_client=llm.configure('shadow')
+        engine=AuditEngine(args.dataset).load()
+        predictions=infer(engine,read_csv(args.dataset/'sample_deletion_requests.csv'))
+        metrics=evaluate(predictions,expected)
+        intent_comparison=compare_intent(root,args.dataset,metrics,expected)
+        if rejected_intent_trial.get('primary_run_usage'):
+            u=rejected_intent_trial['primary_run_usage']
+            with (root/'code/evaluation/usage_report.md').open('a',encoding='utf-8') as stream:
+                stream.write('\n## Rejected primary validation run (separate from final-run totals)\n\n'
+                    f"Provider/model: {u.get('provider')} / {u.get('model')}; live HTTP calls {u.get('live_calls',0)}; "
+                    f"live input tokens {u.get('live_input_tokens',0)}; live output tokens {u.get('live_output_tokens',0)}; "
+                    f"cache hits {u.get('cache_hits',0)}; cached input tokens {u.get('cached_input_tokens',0)}; "
+                    f"cached output tokens {u.get('cached_output_tokens',0)}. "
+                    f"Estimated incremental cost ${u.get('estimated_live_cost_usd',0):.8f}. "
+                    'These development-validation calls are not counted again as live calls when their cached responses are reused by the final shadow run.\n')
     baseline_path=runtime/'cross_case_baseline.json'
     baseline=json.loads(baseline_path.read_text(encoding='utf-8')) if baseline_path.exists() else None
     history_path=Path(__file__).parent/'experiment_history.json'
@@ -133,25 +173,39 @@ def main():
               '| State correction arrives after audit cutoff | Earlier noncompliant state remains decisive | PASS |',
               '| Unknown email on neighboring visual table row | Does not inherit sole recognized page customer | PASS |',
               '| Worker event after report but before audit | Extended ownership only when forced; two candidates abstain | PASS |',
-              '| Explicit lookup lock and competing requests | Lock provenance retained and candidate elimination traced | PASS |','',
+              '| Explicit lookup lock and competing requests | Lock provenance retained and candidate elimination traced | PASS |',
+              '| Groq says true for a Spanish account-closure request (mock HTTP) | Intent True | PASS |',
+              '| Groq says true but request says do not delete | Intent False; refusal wins; disagreement diagnostic | PASS |',
+              '| GROQ_API_KEY absent (network forbidden) | Same answer as rules_intent | PASS |',
+              '| Groq response contains malformed JSON | Same answer as rules_intent; consumed tokens still counted | PASS |',
+              '| A second client reads the cached model/prompt/text response | No second HTTP request; cached tokens reported separately | PASS |',
+              '| Three requests, one COMPLETE and two NOT_STARTED, sharing a window | Status filter assigns the unique account; two FAILED candidates for two subjects stay unassigned | PASS |','',
               'Other regressions cover null/404 lookup ownership, historical aliases, replica drift, incomplete-case full verification, future ownership versus eligible state, contested singletons, input-order determinism and conflicting primary account locks.','',
               '## Changes and remaining failures','',
               '- Added auditable direct-lock provenance, deterministic propagation traces and fixed-point candidate lists over both request files.',
               '- Tested the full audit-time episode window separately. Strict replacement and wider replacement fail the no-regression gate; both remain disabled. Supplemental variants preserve existing results but add no steps.',
               '- Fixed media ownership contamination from unknown neighboring emails and classified state from local resource context.',
               '- Inventoried all 11 screenshots and 4 PDFs, including recognized identifiers, OCR variants, short checksums, statuses, observations and remaining OCR omissions.',
-              '- Ownership cannot be resolved by operation SUCCESS/FAILED, case/resource ID patterns, row order, timestamp proximity, or expected answers.',
+              '- Biggest improvement: every sample deletion has exactly one primary-account step, but the engine grounded only 18/32. Added a primary-account slot (`AuditEngine._slot_assignments`): candidates are deletion-worker account events between reported_at-90min and reported_at+15min whose result is consistent with the workflow claim (COMPLETE->SUCCESS, NOT_STARTED->FAILED, PARTIALLY_COMPLETE->PARTIAL/SUCCESS; 31/32 samples agree, the other has no event). A candidate is assigned only when it is the unique remaining one after one-to-one elimination across all 550 requests; contested candidates stay unassigned. COMPLETE cases drop an inferred account that lacks audit-time evidence instead of citing nothing. Result: status 96.9%->100%, exact rows 46.9%->65.6%, precision stays 100%, and 113 of 518 evaluation rows gained their account step.',
+              '- Tried the same slot for analytics profiles: no sample change, so it was removed. Never uses case/resource ID patterns, row order or expected answers.',
               '', '| Failing case | Predicted status | Expected status | Missing | Extra |','|---|---|---|---:|---:|']
     lines += [f"| {f['case_id']} | {f['predicted_status']} | {f['expected_status']} | {len(f['missing'])} | {len(f['extra'])} |" for f in metrics['failures']]
     lines += ['', '## Measurements for every trial','']+comparison[4:]
     lines += ['', '## Limits','',
               f"Exact-row accuracy is {metrics['exact_row_accuracy']:.4%}. Missing expected steps: {sum(len(f['missing']) for f in metrics['failures'])}; extra: {sum(len(f['extra']) for f in metrics['failures'])}. Unresolved sample decisions: {sum(f['predicted_status']=='UNRESOLVED' for f in metrics['failures'])}. See evidence_gaps.md for all candidates and grouped reasons.",
-              'The media recheck uses existing OCR caches, not a new OCR model. Three small security reference IDs remain unread by OCR, as documented in media_audit.md. Identity availability and multilingual intent handling remain limited. The current agent uses deterministic extraction and local OCR, with no remote generative model. A contract-valid full-dataset output does not prove semantic accuracy.',
+              'The media recheck uses existing OCR caches, not a new OCR model. Three small security reference IDs remain unread by OCR, as documented in media_audit.md. Remaining ownership ambiguities are not resolved by intent classification. Groq classifies intent when a valid answer is available, rules handle missing/invalid responses, and explicit refusal always wins; measured usage is in usage_report.md.',
               '', '## Reproduction','',
               'Run `python code/evaluation/main.py`. Use --cross-case-elimination, optionally --extended-window and --supplemental, to reproduce the rejected/supplemental trials. Run `python code/main.py`, then `python code/main.py validate` for final predictions. No workflow writes log.txt.']
+    intent_lines=write_intent_report(root,intent_comparison,intent_client,
+                                   {r['case_id'] for r in expected},rejected_intent_trial)
+    lines += ['', '## Groq intent step and regression gate','']+intent_lines[2:]
     (folder/'evaluation_report.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+    with (folder/'accuracy_comparison.md').open('a',encoding='utf-8') as stream:
+        stream.write('\n## Groq intent comparison\n\n'+'\n'.join(intent_lines[2:])+'\n')
     print(json.dumps({k:v for k,v in metrics.items() if k!='failures'},indent=2))
     print('Previously correct sample regressions:',broken)
+    print('Intent agreement:',json.dumps(intent_client.agreement({r['case_id'] for r in expected})))
+    print('NOT_APPLICABLE changed cases:',json.dumps(intent_comparison['changed_cases'],ensure_ascii=True))
 
 
 if __name__=='__main__':

@@ -74,7 +74,7 @@ def build(engine, requests, extended=False):
     # one episode, not competing people. No input ordering affects grouping.
     windows = {}
     for request in requests:
-        if not deletion_intent(request['request_text']):
+        if not deletion_intent(request['request_text'],request.get('case_id'),engine.diagnostics):
             continue
         try:
             key = request_key(request, engine.identities)

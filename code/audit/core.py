@@ -10,10 +10,6 @@ from datetime import datetime
 from pathlib import Path
 
 
-def case_key(case_id):
-    return int(case_id.rsplit('_', 1)[1])
-
-
 def read_csv(path):
     with open(path, encoding='utf-8-sig', newline='') as stream:
         return list(csv.DictReader(stream))
@@ -150,7 +146,12 @@ class IdentityIndex:
         return next(iter(candidates))
 
 
-def deletion_intent(text):
+def explicit_refusal(text):
+    t = re.sub(r'\s+', ' ', norm(text).replace('’', "'"))
+    return any(x in t for x in ("don't delete", 'do not delete', 'not a request to erase'))
+
+
+def rules_intent(text):
     """Conservative multilingual intent gate; independent of workflow claims."""
     t = norm(text).replace('’', "'")
     negative = ("don't delete", 'do not delete', 'not a request to erase',
@@ -171,6 +172,25 @@ def deletion_intent(text):
     if 'closed' in t and ('account' in t or 'profile' in t):
         return True
     return False
+
+
+def deletion_intent(text, case_id=None, diagnostics=None):
+    from .llm import get_client
+    client = get_client()
+    rules = rules_intent(text)
+    if text not in client.intent_answers:
+        client.intent_answers[text] = client.classify(text)
+    answer = client.intent_answers[text]
+    refusal = explicit_refusal(text)
+    selected = False if refusal else (answer['deletes'] if answer is not None and client.mode == 'primary' else rules)
+    client.record(text,rules,answer,selected,case_id,refusal)
+    if answer is not None and answer['deletes'] != rules and diagnostics is not None:
+        diagnostic = dict(case_id=case_id, issue='LLM/rules intent disagreement',
+                          rules_deletes=rules,llm_deletes=answer['deletes'],
+                          selected_deletes=selected,explicit_refusal=refusal,reason=answer['reason'])
+        if diagnostic not in diagnostics:
+            diagnostics.append(diagnostic)
+    return selected
 
 
 class AuditEngine:
@@ -204,7 +224,67 @@ class AuditEngine:
     def workflow_resources(self, request, uid):
         if getattr(self, 'enable_ownership_elimination', False):
             return self._eliminated_workflow_resources(request, uid)
-        return self._baseline_workflow_resources(request, uid)
+        result = self._baseline_workflow_resources(request, uid)
+        self._inferred = set()
+        for system, window, by_status in self.WORKFLOW_SLOTS:
+            if not any(s == system for s, _ in result):
+                resource = self._slot_assignments(system, window, by_status).get(uid)
+                if resource:
+                    result.add((system, resource))
+                    self._inferred.add((system, resource))
+        return result
+
+    # A workflow's reported_status is derived from its own primary-account
+    # operation, so only status-consistent worker results are candidates.
+    STATUS_RESULTS = {'COMPLETE': {'SUCCESS'}, 'NOT_STARTED': {'FAILED'},
+                      'PARTIALLY_COMPLETE': {'PARTIAL', 'SUCCESS'}}
+    # (system, seconds before/after reported_at, filter by STATUS_RESULTS);
+    # windows are the spans observed between worker events and workflow reports.
+    WORKFLOW_SLOTS = [('account_service', (5400, 900), True)]
+
+    def _slot_assignments(self, system, window, by_status):
+        """One resource per subject and system: candidates are worker events
+        near the workflow report; uniquely remaining candidates are assigned
+        iteratively across all requests. Ambiguity stays unassigned."""
+        cache = self.__dict__.setdefault('_slot_cache', {})
+        if system in cache:
+            return cache[system]
+        stamp = lambda s: datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()
+        events = [e for e in self.activities if e['source_system'] == 'deletion_worker'
+                  and e['target_system'] == system]
+        candidates = defaultdict(set)
+        for request in getattr(self, 'request_windows', []):
+            if not deletion_intent(request['request_text'],request.get('case_id'),self.diagnostics):
+                continue
+            try:
+                uid = self.identities.resolve(request['email'])
+            except ValueError:
+                continue
+            reported = stamp(min(request.get('reported_at', request['audit_at']), request['audit_at']))
+            allowed = self.STATUS_RESULTS.get(request.get('reported_status'), set())
+            for e in events:
+                owners = {u for u, _, _ in self.resource_links.get((system, e['resource_id']), ())}
+                if ((not by_status or e['reported_result'] in allowed) and owners <= {uid}
+                        and request.get('requested_at', '') <= e['event_time']
+                        and reported - window[0] <= stamp(e['event_time']) <= reported + window[1]):
+                    candidates[uid].add(e['resource_id'])
+        owned = {uid: {r for r in rs if uid in {u for u, _, _ in self.resource_links.get((system, r), ())}}
+                 for uid, rs in candidates.items()}
+        assigned = {uid: next(iter(rs)) for uid, rs in owned.items() if len(rs) == 1}
+        while True:
+            taken = set(assigned.values())
+            new = {uid: next(iter(rs - taken)) for uid, rs in sorted(candidates.items())
+                   if uid not in assigned and len(rs - taken) == 1}
+            # Two subjects claiming the same last candidate is ambiguity, not a win.
+            claims = defaultdict(list)
+            for uid, account in new.items():
+                claims[account].append(uid)
+            new = {uid: a for uid, a in new.items() if len(claims[a]) == 1}
+            if not new:
+                break
+            assigned.update(new)
+        cache[system] = assigned
+        return assigned
 
     def _baseline_workflow_resources(self, request, uid):
         """Previously validated behavior, retained after the strict experiment
@@ -235,7 +315,7 @@ class AuditEngine:
             for candidate in getattr(self, 'request_windows', []) + [request]:
                 if (candidate.get('requested_at', '') <= event['event_time']
                         <= min(candidate.get('reported_at', ''), candidate['audit_at'])
-                        and deletion_intent(candidate['request_text'])):
+                        and deletion_intent(candidate['request_text'],candidate.get('case_id'),self.diagnostics)):
                     try:
                         owner = self.identities.resolve(candidate['email'])
                     except ValueError:
@@ -366,7 +446,7 @@ class AuditEngine:
 
     def audit(self, request):
         case = request['case_id']
-        if not deletion_intent(request['request_text']):
+        if not deletion_intent(request['request_text'],case,self.diagnostics):
             return {'case_id': case, 'deletion_status': 'NOT_APPLICABLE', 'steps_json': '[]'}
         uid = self.identities.resolve(request['email'])
         cutoff = request['audit_at']
@@ -432,6 +512,11 @@ class AuditEngine:
         if not states:
             raise ValueError(f'{case}: no eligible state evidence; refusing unsupported completion')
         status = 'INCOMPLETE' if violations else 'COMPLETE'
+        inferred = {(o.system, o.resource) for o in unknown} & getattr(self, '_inferred', set())
+        if inferred and not violations:
+            # A COMPLETE check must cite evidence; an inferred owner without it is omitted.
+            unknown = [o for o in unknown if (o.system, o.resource) not in inferred]
+            checks = [c for c in checks if (c['system_id'], c['resource_id']) not in inferred]
         if unknown and not violations:
             raise ValueError(f'{case}: linked resources lack eligible state evidence; refusing unsupported completion')
         if violations:
@@ -443,7 +528,7 @@ class AuditEngine:
         return {'case_id': case, 'deletion_status': status, 'steps_json': json.dumps(steps, ensure_ascii=False, separators=(',', ':'))}
 
     def validate(self, rows, requests):
-        expected = sorted((r['case_id'] for r in requests), key=case_key)
+        expected = sorted(r['case_id'] for r in requests)
         if [r['case_id'] for r in rows] != expected or len(set(expected)) != len(expected):
             raise ValueError('Missing, duplicate, or unsorted cases')
         request_map = {r['case_id']: r for r in requests}

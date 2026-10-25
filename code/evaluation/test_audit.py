@@ -1,15 +1,191 @@
 """Authored behavioral regressions, independent of public expected outputs."""
 import json
+import csv
+import os
 import sys
+import tempfile
 import unittest
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch, MagicMock
+from urllib.error import HTTPError
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from audit.core import AuditEngine, Observation, IdentityIndex, case_key, deletion_intent, scalars
+from audit.core import AuditEngine, Observation, IdentityIndex, deletion_intent, rules_intent, scalars
+from audit import llm
 from audit.ingestion import log_fields, record_state, media_context
 from audit.layout import resource_regions
+
+TEST_TEMP = Path(__file__).resolve().parents[2]/'.runtime'/'test_temp'
+
+
+def setUpModule():
+    # No live environment credentials or network may be used by ANY unit test.
+    global _test_environment, _test_network, _test_client, _test_cache
+    TEST_TEMP.mkdir(parents=True,exist_ok=True)
+    _test_cache = tempfile.TemporaryDirectory(dir=TEST_TEMP)
+    _test_environment = patch.dict(os.environ, {'GROQ_API_KEY': ''})
+    _test_network = patch('audit.llm.request.urlopen', side_effect=AssertionError('Network forbidden in unit tests'))
+    _test_client = patch.object(llm, '_default_client', llm.IntentClassifier(cache_dir=_test_cache.name))
+    for guard in (_test_environment, _test_network, _test_client): guard.start()
+
+
+def tearDownModule():
+    for guard in (_test_client, _test_network, _test_environment): guard.stop()
+    _test_cache.cleanup()
+
+
+class GroqIntentRegressions(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=TEST_TEMP)
+        self.addCleanup(self.temp.cleanup)
+        self.client = llm.IntentClassifier(cache_dir=self.temp.name)
+        # Synthetic fixture only; no real credential is embedded in tests.
+        self.environment = patch.dict(os.environ, {'GROQ_API_KEY': 'unit-test-credential-placeholder'})
+        self.environment.start();self.addCleanup(self.environment.stop)
+        self.client_patch = patch('audit.llm.get_client',return_value=self.client)
+        self.client_patch.start();self.addCleanup(self.client_patch.stop)
+
+    def response(self, content='{"deletes":true,"reason":"Account closure requested"}'):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(dict(
+            choices=[{'message': {'content': content}}],
+            usage={'prompt_tokens': 100, 'completion_tokens': 12})).encode('utf-8')
+        return response
+
+    def test_spanish_deletion_llm_returns_true(self):
+        with patch('audit.llm.request.urlopen',return_value=self.response()) as http:
+            self.assertTrue(deletion_intent('Quiero cerrar mi cuenta permanentemente.'))
+        payload=json.loads(http.call_args.args[0].data)
+        self.assertEqual(payload['model'],llm.MODEL)
+        self.assertEqual(payload['temperature'],0)
+        self.assertEqual(payload['response_format'],{'type':'json_object'})
+        self.assertEqual(payload['reasoning_effort'],'low')
+        self.assertFalse(payload['include_reasoning'])
+        self.assertEqual(payload['max_completion_tokens'],512)
+        self.assertEqual(http.call_args.kwargs['timeout'],20)
+        self.assertEqual(http.call_args.args[0].get_header('User-agent'),llm.USER_AGENT)
+
+    def test_explicit_refusal_overrides_llm_and_records_disagreement(self):
+        diagnostics=[]
+        with patch('audit.llm.request.urlopen',return_value=self.response()):
+            self.assertFalse(deletion_intent('Please export my records; do not delete my account.',
+                                            'synthetic-refusal',diagnostics))
+        self.assertEqual(len(diagnostics),1)
+        self.assertTrue(diagnostics[0]['explicit_refusal'])
+
+    def test_no_api_key_falls_back_to_rules(self):
+        with patch.dict(os.environ,{'GROQ_API_KEY':''}), patch('audit.llm.request.urlopen') as http:
+            for text in ('Delete my account','Export my records','Quiero cerrar mi cuenta.'):
+                self.assertEqual(deletion_intent(text),rules_intent(text))
+            http.assert_not_called()
+
+    def test_invalid_llm_json_falls_back_to_rules(self):
+        with patch('audit.llm.request.urlopen',return_value=self.response('not JSON')):
+            self.assertEqual(deletion_intent('Delete my account'),rules_intent('Delete my account'))
+        # Provider usage is still consumed even when the answer is unusable.
+        self.assertEqual(self.client.usage()['live_input_tokens'],100)
+
+    def test_disk_cache_reused_without_second_http_request(self):
+        with patch('audit.llm.request.urlopen',return_value=self.response()) as http:
+            first=self.client.classify('Close my account')
+            second_client=llm.IntentClassifier(cache_dir=self.temp.name)
+            second=second_client.classify('Close my account')
+            self.assertEqual(first,second)
+            self.assertEqual(http.call_count,1)
+        usage=second_client.usage()
+        self.assertEqual(usage['cache_hits'],1)
+        self.assertEqual(usage['cached_input_tokens'],100)
+        self.assertEqual(usage['cached_output_tokens'],12)
+        self.assertEqual(usage['live_calls'],0)
+        self.assertEqual(usage['total_tokens'],112)
+
+    def test_shadow_mode_retains_rules_and_logs_llm_opinion(self):
+        self.client.mode='shadow';diagnostics=[]
+        with patch('audit.llm.request.urlopen',return_value=self.response()):
+            self.assertFalse(deletion_intent('Quiero cerrar mi cuenta.', 'synthetic-shadow',diagnostics))
+        self.assertEqual(len(diagnostics),1)
+
+    def test_retry_once_on_429_or_5xx_and_not_400(self):
+        for status in (429,503,400):
+            client=llm.IntentClassifier(cache_dir=Path(self.temp.name)/str(status))
+            failure=HTTPError(llm.ENDPOINT,status,'synthetic error',{},None)
+            with patch('audit.llm.request.urlopen',side_effect=[failure,self.response()]) as http, patch('audit.llm.time.sleep'):
+                result=client.classify('Close my account')
+                self.assertEqual(http.call_count,1 if status==400 else 2)
+                self.assertEqual(result is None,status==400)
+
+    def test_missing_provider_model_falls_back_with_safe_status_diagnostic(self):
+        failure=HTTPError(llm.ENDPOINT,404,'synthetic unavailable model',{},None)
+        with patch('audit.llm.request.urlopen',side_effect=failure) as http:
+            self.assertEqual(deletion_intent('Close my account'),rules_intent('Close my account'))
+            self.assertEqual(deletion_intent('Delete my profile'),rules_intent('Delete my profile'))
+            self.assertEqual(http.call_count,1)
+        self.assertEqual(self.client.usage()['http_failures_by_status'],{'404':1})
+        self.assertEqual(self.client.usage()['skipped_unavailable'],1)
+
+    def test_string_boolean_and_corrupt_cache_are_rejected(self):
+        with patch('audit.llm.request.urlopen',return_value=self.response('{"deletes":"true","reason":"wrong type"}')):
+            self.assertIsNone(self.client.classify('Erase my profile'))
+        self.assertFalse(list(Path(self.temp.name).glob('*.json')))
+
+    def test_in_process_repeated_lookups_do_not_inflate_tokens(self):
+        with patch('audit.llm.request.urlopen',return_value=self.response()) as http:
+            for _ in range(5):deletion_intent('Close my account')
+            self.assertEqual(http.call_count,1)
+        self.assertEqual(self.client.usage()['input_tokens'],100)
+        self.client.classify('Close my account')
+        self.assertEqual(self.client.usage()['cache_hits'],1)
+        self.assertEqual(self.client.usage()['cached_input_tokens'],100)
+
+    def test_changed_prompt_invalidates_disk_cache(self):
+        prompt=Path(self.temp.name)/'prompt.md';prompt.write_text('Classify intent as JSON.',encoding='utf-8')
+        with patch('audit.llm.request.urlopen',return_value=self.response()) as http:
+            llm.IntentClassifier(cache_dir=self.temp.name,prompt_path=prompt).classify('Close account')
+            prompt.write_text('Classify intent as JSON with new policy.',encoding='utf-8')
+            llm.IntentClassifier(cache_dir=self.temp.name,prompt_path=prompt).classify('Close account')
+            self.assertEqual(http.call_count,2)
+
+    def test_explicit_refusal_handles_whitespace_and_curly_apostrophe(self):
+        with patch('audit.llm.request.urlopen',return_value=self.response()):
+            self.assertFalse(deletion_intent('DO   NOT\nDELETE my account'))
+            self.assertFalse(deletion_intent('Please don’t delete my account'))
+
+    def test_agreement_does_not_treat_unavailable_answers_as_agreement(self):
+        self.client.record('a',True,{'deletes':True,'reason':'Delete'},True,'a')
+        self.client.record('b',True,{'deletes':False,'reason':'Export'},False,'b')
+        self.client.record('c',False,None,False,'c')
+        summary=self.client.agreement({'a','b','c'})
+        self.assertEqual(summary['agreement_rate'],0.5)
+        self.assertEqual(summary['unavailable'],1)
+
+    def test_cache_persists_no_request_headers_or_credential(self):
+        with patch('audit.llm.request.urlopen',return_value=self.response()):
+            self.client.classify('Close my account')
+        content=next(Path(self.temp.name).glob('*.json')).read_text(encoding='utf-8')
+        self.assertEqual(set(json.loads(content)),{'model','answer','usage'})
+        self.assertNotIn('Authorization',content)
+        self.assertNotIn('unit-test-credential-placeholder',content)
+
+    def test_evaluation_gate_flags_regression_and_changed_non_deletion(self):
+        from intent_evaluation import comparison,METRICS
+        root=Path(self.temp.name);runtime=root/'.runtime';runtime.mkdir()
+        dataset=root/'dataset';dataset.mkdir()
+        baseline={name:1.0 for name in METRICS};baseline['failures']=[]
+        (runtime/'pre_groq_metrics.json').write_text(json.dumps(baseline),encoding='utf-8')
+        for path,status in [(runtime/'pre_groq_output.csv','INCOMPLETE'),(root/'output.csv','NOT_APPLICABLE')]:
+            with path.open('w',encoding='utf-8',newline='') as stream:
+                writer=csv.DictWriter(stream,fieldnames=['case_id','deletion_status','steps_json'])
+                writer.writeheader();writer.writerow(dict(case_id='synthetic',deletion_status=status,steps_json='[]'))
+        with (dataset/'deletion_requests.csv').open('w',encoding='utf-8',newline='') as stream:
+            writer=csv.DictWriter(stream,fieldnames=['case_id','request_text'])
+            writer.writeheader();writer.writerow(dict(case_id='synthetic',request_text='Close my account'))
+        actual=dict(baseline,status_accuracy=0.0,failures=[{'case_id':'synthetic'}])
+        report=comparison(root,dataset,actual,[{'case_id':'synthetic'}])
+        self.assertTrue(report['gate_failed'])
+        self.assertIn('status_accuracy',report['degraded_metrics'])
+        self.assertEqual(report['changed_cases'][0]['request_text'],'Close my account')
 
 
 def engine():
@@ -48,8 +224,17 @@ def worker(resource, result='FAILED', time='2026-01-10T00:00:00Z'):
 
 
 class AuditRegressions(unittest.TestCase):
-    def test_case_ids_sort_numerically(self):
-        self.assertEqual(sorted(['case_100','case_33','case_9'],key=case_key),['case_9','case_33','case_100'])
+    def test_primary_account_slot_uses_status_and_elimination(self):
+        e=engine();people={'a@x.test':'user_a','b@x.test':'user_b','c@x.test':'user_c'}
+        e.identities=SimpleNamespace(resolve=lambda m:people[m],match=lambda d:set())
+        req=lambda m,st:dict(email=m,request_text='Delete my account',reported_status=st,requested_at='2026-01-01T00:00:00Z',
+                             reported_at='2026-01-02T12:00:00Z',audit_at='2026-02-01T00:00:00Z')
+        e.request_windows=[req('a@x.test','COMPLETE'),req('b@x.test','NOT_STARTED'),req('c@x.test','NOT_STARTED')]
+        e.activities=[worker('account_1','SUCCESS','2026-01-02T11:00:00Z'),worker('account_2','FAILED','2026-01-02T11:10:00Z'),
+                      worker('account_3','FAILED','2026-01-02T11:20:00Z'),worker('account_9','SUCCESS','2026-01-01T01:00:00Z')]
+        got=e._slot_assignments('account_service',(5400,900),True)
+        # Status filter makes user_a unique; user_b/user_c share two FAILED candidates and stay unassigned.
+        self.assertEqual(got,{'user_a':'account_1'})
 
     def test_authorization_negation(self):
         e=engine();add(e,'account_example','USER_PROFILE','PRESENT')

@@ -1,0 +1,46 @@
+{
+  "metrics": {
+    "status_accuracy": 1.0,
+    "exact_row_accuracy": 0.65625,
+    "sequence_accuracy": 0.65625,
+    "step_precision": 1.0,
+    "step_recall": 0.9378238341968912,
+    "step_f1": 0.9679144385026738,
+    "field_accuracy": 0.9222797927461139
+  },
+  "correct_cases": [
+    "case_01",
+    "case_02",
+    "case_05",
+    "case_06",
+    "case_07",
+    "case_08",
+    "case_09",
+    "case_10",
+    "case_11",
+    "case_12",
+    "case_13",
+    "case_14",
+    "case_15",
+    "case_16",
+    "case_17",
+    "case_19",
+    "case_22",
+    "case_24",
+    "case_30",
+    "case_31",
+    "case_32"
+  ],
+  "not_applicable": [
+    "case_533",
+    "case_534",
+    "case_535",
+    "case_536",
+    "case_537",
+    "case_538",
+    "case_539",
+    "case_540",
+    "case_541",
+    "case_542"
+  ]
+}
